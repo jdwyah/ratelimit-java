@@ -1,0 +1,80 @@
+package it.ratelim.data;
+
+option java_outer_classname = "RateLimitProtos";
+
+message LimitResponse {
+    enum LimitPolicyNames {
+        SECONDLY = 1;
+        MINUTELY = 2;
+        MINUTELY_ROLLING = 3;
+        HOURLY = 4;
+        HOURLY_ROLLING = 5;
+        DAILY = 6;
+        DAILY_ROLLING = 7;
+        MONTHLY = 8;
+        INFINITE = 9;
+    }
+
+    optional bool passed = 1 [default = true];
+    optional int64 expires_at = 2;             // for returnable: rtn this value
+    optional string enforced_group = 3;        // events:pageview:homepage:123123
+    optional int64 current_bucket = 4;         // 9
+    optional string policy_group = 5;          // events:pageview
+    optional LimitPolicyNames policy_name = 6; // MINUTELY
+    optional int32 policy_limit = 7;           // 10
+    optional int64 amount = 8 [default = 1];   // 1
+    optional int64 limit_reset_at = 9;
+    optional LimitDefinition.SafetyLevel safety_level = 10;
+}
+
+message LimitRequest {
+    optional int64 account_id = 1;
+    optional bytes partition_key = 2;
+    optional int32 acquire_amount = 3 [default = 1];
+    repeated string groups = 4;
+
+    enum LimitCombiner {
+        MINIMUM = 1;
+        MAXIMUM = 2;
+    }
+
+    optional LimitCombiner limit_combiner = 5 [default = MAXIMUM];
+
+    optional bool persist_request = 7 [default = true];
+    optional bool allow_partial_response = 8 [default = false];
+}
+
+message TokenBucket {
+    optional int64 current_value = 1;
+    optional int64 time_key = 2;
+    repeated int64 expiries = 3;
+}
+
+message FeatureFlag {
+    optional int64 account_id = 1;
+    optional string feature = 2;
+    optional double pct = 3 [default = 0];
+    repeated string whitelisted = 4;
+    optional string prior_feature_name = 5;
+}
+
+message LimitDefinition {
+    enum SafetyLevel {
+        L4_BEST_EFFORT = 4;
+        L5_BOMBPROOF = 5;
+    }
+
+    optional string group = 1;
+    optional LimitResponse.LimitPolicyNames policy_name = 2;
+    optional int32 limit = 3;
+    optional int32 burst = 4;
+    optional int64 account_id = 5;
+    optional int64 last_modified = 6;
+    optional bool returnable = 7;
+    optional SafetyLevel safety_level = 8 [default = L4_BEST_EFFORT];
+}
+
+message BucketWrite {
+    optional TokenBucket tokenBucket = 1;
+    optional string bucket = 2;
+}
