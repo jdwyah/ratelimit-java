@@ -72,6 +72,12 @@ message LimitDefinitions {
     repeated LimitDefinition definitions = 1;
 }
 
+enum OnFailure {
+    LOG_AND_PASS = 1;
+    LOG_AND_FAIL = 2;
+    THROW = 3;
+}
+
 message FeatureFlags {
     repeated FeatureFlag flags = 1;
 }

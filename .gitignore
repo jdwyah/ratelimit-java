@@ -55,3 +55,6 @@ buildNumber.properties
 
 # Exclude maven wrapper
 !/.mvn/wrapper/maven-wrapper.jar
+README_INTERNAL.md
+src/main/java/it/ratelim/client/Tester.java
+ratelimit-java.iml
