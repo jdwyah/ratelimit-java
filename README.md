@@ -17,6 +17,13 @@ if(apiClient.isPass("pageload")){
         System.out.println("do hourly thing");
 }
 ```
+```xml
+<dependency>
+  <groupId>it.ratelim</groupId>
+  <artifactId>ratelimit-java</artifactId>
+  <version>0.0.2</version>
+</dependency>
+```
 See full documentation http://www.ratelim.it/documentation
 
 
