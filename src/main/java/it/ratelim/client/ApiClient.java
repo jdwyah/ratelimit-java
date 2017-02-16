@@ -12,10 +12,12 @@ import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.CredentialsProvider;
 import org.apache.http.client.ResponseHandler;
+import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpPut;
 import org.apache.http.entity.ByteArrayEntity;
+import org.apache.http.impl.auth.BasicScheme;
 import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
@@ -25,7 +27,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -62,13 +63,16 @@ public class ApiClient {
 
     this.accountId = apikeyparts[0];
 
+    final UsernamePasswordCredentials credentials = new UsernamePasswordCredentials(accountId, apikeyparts[1]);
     credsProvider.setCredentials(
         new AuthScope(builder.getHost(), builder.getPort()),
-        new UsernamePasswordCredentials(accountId, apikeyparts[1]));
+        credentials);
 
     Header header = new BasicHeader(HttpHeaders.CONTENT_TYPE, Consts.PROTO_BUF_CONTENT_TYPE);
     List<Header> headers = new ArrayList<>();
     headers.add(header);
+    headers.add(BasicScheme.authenticate(credentials, "UTF8", false));//pre-emptive auth
+
 
     httpClient = HttpClients.custom()
         .setDefaultHeaders(headers)
@@ -166,7 +170,7 @@ public class ApiClient {
     HttpPost httppost = new HttpPost(getUrl("limits"));
     ByteArrayEntity entity = new ByteArrayEntity(limitDefinition.toByteArray());
     httppost.setEntity(entity);
-    httpClient.execute(httppost);
+    final CloseableHttpResponse execute = httpClient.execute(httppost);
   }
 
   /**
@@ -179,7 +183,7 @@ public class ApiClient {
     HttpPut httpPut = new HttpPut(getUrl("limits"));
     ByteArrayEntity entity = new ByteArrayEntity(limitDefinition.toByteArray());
     httpPut.setEntity(entity);
-    httpClient.execute(httpPut);
+    final CloseableHttpResponse execute = httpClient.execute(httpPut);
   }
 
 
