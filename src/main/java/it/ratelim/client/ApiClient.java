@@ -204,7 +204,7 @@ public class ApiClient {
       if (!featureFlag.isPresent()) {
         return false;
       }
-      return FeatureFlagProcessor.isOnFor(featureFlag.get(), lookupKey, attributes);
+      return new FeatureFlagWrapper(featureFlag.get()).isOnFor(lookupKey, attributes);
 
     } catch (ExecutionException e) {
       handleError(e, null, RateLimitProtos.OnFailure.LOG_AND_PASS);
