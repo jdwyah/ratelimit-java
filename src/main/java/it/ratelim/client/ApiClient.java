@@ -63,9 +63,17 @@ public class ApiClient implements Closeable {
     this.featureFlagMemcachedSecs = builder.getFeatureFlagMemcachedSecs();
     this.featureFlagRefetchBuffer = builder.getFeatureFlagRefetchBuffer();
     this.featureFlagInProcessCacheSecs = builder.getFeatureFlagInProcessCacheSecs();
-    final String[] apikeyparts = builder.getApikey().split("\\|");
-    this.accountId = apikeyparts[0];
-    final String pass = apikeyparts[1];
+
+    String pass;
+    if (builder.getApikey() == null) {
+      LOGGER.warn("Misconfigured RateLimitAPIClient. No API KEY. Set RATELIMIT_API_KEY");
+      accountId = "";
+      pass = "";
+    } else {
+      final String[] apikeyparts = builder.getApikey().split("\\|");
+      this.accountId = apikeyparts[0];
+      pass = apikeyparts[1];
+    }
     this.urlBase = String.format("%s://%s:%d/api/v1/",
         builder.getPort() == 443 ? "https" : "http",
         builder.getHost(),
@@ -222,7 +230,7 @@ public class ApiClient implements Closeable {
       return new FeatureFlagWrapper(featureFlag.get()).isOnFor(lookupKey, attributes);
 
     } catch (ExecutionException e) {
-      handleError(e, null, RateLimitProtos.OnFailure.LOG_AND_PASS);
+      handleError(e, Optional.empty(), RateLimitProtos.OnFailure.LOG_AND_PASS);
     }
 
     return false;
