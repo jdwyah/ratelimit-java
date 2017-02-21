@@ -80,6 +80,7 @@ enum OnFailure {
 
 message FeatureFlags {
     repeated FeatureFlag flags = 1;
+    optional int64 cache_expiry = 2;
 }
 
 message BucketWrite {

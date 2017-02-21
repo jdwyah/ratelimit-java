@@ -23,20 +23,24 @@ import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.message.BasicHeader;
 import org.apache.http.util.EntityUtils;
+import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static com.google.common.cache.CacheBuilder.newBuilder;
 
-public class ApiClient {
+public class ApiClient implements Closeable {
   private static final Logger LOGGER = LoggerFactory.getLogger(ApiClient.class);
 
   private final CloseableHttpClient httpClient;
@@ -46,24 +50,44 @@ public class ApiClient {
   private Optional<MemcachedClientIF> memcachedClientIF = Optional.empty();
   private Optional<String> featureFlagCacheKey = Optional.empty();
 
+  private LoadingCache<String, Optional<RateLimitProtos.FeatureFlag>> inProcessFlagCache;
+  private final int featureFlagMemcachedSecs;
+  private final long featureFlagRefetchBuffer;
+  private final int featureFlagInProcessCacheSecs;
 
-  private LoadingCache<String, Optional<RateLimitProtos.FeatureFlag>> flagCache;
-
+  private Executor background = Executors.newSingleThreadExecutor();
 
   public ApiClient(Builder builder) {
 
+    this.memcachedClientIF = builder.getMemcachedClientIF();
+    this.featureFlagMemcachedSecs = builder.getFeatureFlagMemcachedSecs();
+    this.featureFlagRefetchBuffer = builder.getFeatureFlagRefetchBuffer();
+    this.featureFlagInProcessCacheSecs = builder.getFeatureFlagInProcessCacheSecs();
+    final String[] apikeyparts = builder.getApikey().split("\\|");
+    this.accountId = apikeyparts[0];
+    final String pass = apikeyparts[1];
     this.urlBase = String.format("%s://%s:%d/api/v1/",
         builder.getPort() == 443 ? "https" : "http",
         builder.getHost(),
         builder.getPort());
-    this.memcachedClientIF = builder.getMemcachedClientIF();
 
+    httpClient = setupHttpClient(builder, pass);
+
+    inProcessFlagCache = newBuilder()
+        .maximumSize(1000)
+        .expireAfterWrite(featureFlagInProcessCacheSecs, TimeUnit.SECONDS)
+        .build(
+            new CacheLoader<String, Optional<RateLimitProtos.FeatureFlag>>() {
+              public Optional<RateLimitProtos.FeatureFlag> load(String feature) throws IOException {
+                return getAllFlagsInternal(feature);
+              }
+            });
+  }
+
+  private CloseableHttpClient setupHttpClient(Builder builder, String pass) {
     CredentialsProvider credsProvider = new BasicCredentialsProvider();
-    final String[] apikeyparts = builder.getApikey().split("\\|");
 
-    this.accountId = apikeyparts[0];
-
-    final UsernamePasswordCredentials credentials = new UsernamePasswordCredentials(accountId, apikeyparts[1]);
+    final UsernamePasswordCredentials credentials = new UsernamePasswordCredentials(accountId, pass);
     credsProvider.setCredentials(
         new AuthScope(builder.getHost(), builder.getPort()),
         credentials);
@@ -73,21 +97,10 @@ public class ApiClient {
     headers.add(header);
     headers.add(BasicScheme.authenticate(credentials, "UTF8", false));//pre-emptive auth
 
-
-    httpClient = HttpClients.custom()
+    return HttpClients.custom()
         .setDefaultHeaders(headers)
         .setDefaultCredentialsProvider(credsProvider)
         .build();
-
-    flagCache = newBuilder()
-        .maximumSize(1000)
-        .expireAfterWrite(1, TimeUnit.MINUTES)
-        .build(
-            new CacheLoader<String, Optional<RateLimitProtos.FeatureFlag>>() {
-              public Optional<RateLimitProtos.FeatureFlag> load(String feature) throws IOException {
-                return getFlagInternal(feature);
-              }
-            });
   }
 
 
@@ -117,20 +130,24 @@ public class ApiClient {
     try {
       return httpClient.execute(httppost, responseHandler);
     } catch (IOException e) {
-      return handleError(e, limitRequest, onFailure);
+      return handleError(e, Optional.of(limitRequest), onFailure);
     }
   }
 
-  private RateLimitProtos.LimitResponse handleError(Exception e, RateLimitProtos.LimitRequest limitRequest, RateLimitProtos.OnFailure onFailure) {
+  private RateLimitProtos.LimitResponse handleError(Exception e, Optional<RateLimitProtos.LimitRequest> limitRequest, RateLimitProtos.OnFailure onFailure) {
+    String errorMsg = "Problem";
+    if (limitRequest.isPresent()) {
+      errorMsg = "Problem " + limitRequest.get().getGroupsList();
+    }
     switch (onFailure) {
       case LOG_AND_FAIL:
-        LOGGER.warn("Problem {}", limitRequest.getGroupsList());
+        LOGGER.warn(errorMsg, e);
         return RateLimitProtos.LimitResponse.newBuilder().setPassed(false).build();
       case LOG_AND_PASS:
-        LOGGER.warn("Problem {}", limitRequest.getGroupsList());
+        LOGGER.warn(errorMsg, e);
         return RateLimitProtos.LimitResponse.newBuilder().setPassed(true).build();
       case THROW:
-        LOGGER.warn("Problem {}", limitRequest.getGroupsList());
+        LOGGER.warn(errorMsg, e);
         throw new RateLimitException(e);
     }
     throw new RuntimeException("Unknown Failure Handing State");
@@ -196,10 +213,8 @@ public class ApiClient {
   }
 
   public boolean featureIsOnFor(String feature, Optional<String> lookupKey, List<String> attributes) {
-
-
     try {
-      final Optional<RateLimitProtos.FeatureFlag> featureFlag = flagCache.get(feature);
+      final Optional<RateLimitProtos.FeatureFlag> featureFlag = inProcessFlagCache.get(feature);
 
       if (!featureFlag.isPresent()) {
         return false;
@@ -213,12 +228,11 @@ public class ApiClient {
     return false;
   }
 
-  private Optional<RateLimitProtos.FeatureFlag> getFlagInternal(String feature) throws IOException {
+  private Optional<RateLimitProtos.FeatureFlag> getAllFlagsInternal(String feature) throws IOException {
     return getAllFlags().stream()
         .filter((ff) -> ff.getFeature().equals(feature))
         .findFirst();
   }
-
 
   public Collection<RateLimitProtos.FeatureFlag> getAllFlags() throws IOException {
     if (memcachedClientIF.isPresent()) {
@@ -230,10 +244,13 @@ public class ApiClient {
       RateLimitProtos.FeatureFlags featureFlags;
       if (bytes == null) {
         featureFlags = getAllFlagsReq();
-        memcachedClientIF.get().set(featureFlagCacheKey.get(), 60, featureFlags.toByteArray());
+        memcachedClientIF.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, featureFlags.toByteArray());
         return featureFlags.getFlagsList();
       } else {
         featureFlags = RateLimitProtos.FeatureFlags.parseFrom(bytes);
+
+        fetchAndCacheFlagsAsyncIfNecessary(featureFlags);
+
         return featureFlags.getFlagsList();
       }
     } else {
@@ -241,17 +258,44 @@ public class ApiClient {
     }
   }
 
+  /**
+   * if it's almost time for memcache to expire, reload all flags (add some jitter to help avoid dogpiling)
+   *
+   * @param featureFlags
+   */
+  private void fetchAndCacheFlagsAsyncIfNecessary(RateLimitProtos.FeatureFlags featureFlags) {
+    if (featureFlags.getCacheExpiry() < DateTime.now().getMillis() + featureFlagRefetchBuffer * Math.random()) {
+      background.execute(() -> {
+        try {
+          final RateLimitProtos.FeatureFlags newFeatureFlags = getAllFlagsReq();
+          memcachedClientIF.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, newFeatureFlags.toByteArray());
+        } catch (IOException e) {
+          LOGGER.warn("Exception trying background feature flag sync", e);
+        }
+      });
+    }
+  }
+
+
   private RateLimitProtos.FeatureFlags getAllFlagsReq() throws IOException {
     HttpGet req = new HttpGet(getUrl("featureflags"));
     ResponseHandler<RateLimitProtos.FeatureFlags> responseHandler = response -> {
       int status = response.getStatusLine().getStatusCode();
       if (status >= 200 && status < 300) {
-        return RateLimitProtos.FeatureFlags.parseFrom(EntityUtils.toByteArray(response.getEntity()));
+        final RateLimitProtos.FeatureFlags featureFlags = RateLimitProtos.FeatureFlags.parseFrom(EntityUtils.toByteArray(response.getEntity()));
+        return featureFlags.toBuilder()
+            .setCacheExpiry(DateTime.now().getMillis() + featureFlagMemcachedSecs)
+            .build();
       } else {
         throw new ClientProtocolException("Unexpected response status: " + status);
       }
     };
     return httpClient.execute(req, responseHandler);
+  }
+
+  @Override
+  public void close() throws IOException {
+    httpClient.close();
   }
 
 
@@ -260,6 +304,9 @@ public class ApiClient {
     private int port = 443;
     private String apikey;
     private Optional<net.spy.memcached.MemcachedClientIF> memcachedClientIF = Optional.empty();
+    private int featureFlagMemcachedSecs = 60;
+    private long featureFlagRefetchBuffer = 10;
+    private int featureFlagInProcessCacheSecs = 50;
 
     public Builder() {
       this.apikey = System.getenv("RATELIMIT_API_KEY");
@@ -299,6 +346,33 @@ public class ApiClient {
 
     public String getApikey() {
       return apikey;
+    }
+
+    public int getFeatureFlagMemcachedSecs() {
+      return featureFlagMemcachedSecs;
+    }
+
+    public Builder setFeatureFlagMemcachedSecs(int featureFlagMemcachedSecs) {
+      this.featureFlagMemcachedSecs = featureFlagMemcachedSecs;
+      return this;
+    }
+
+    public long getFeatureFlagRefetchBuffer() {
+      return featureFlagRefetchBuffer;
+    }
+
+    public Builder setFeatureFlagRefetchBuffer(long featureFlagRefetchBuffer) {
+      this.featureFlagRefetchBuffer = featureFlagRefetchBuffer;
+      return this;
+    }
+
+    public int getFeatureFlagInProcessCacheSecs() {
+      return featureFlagInProcessCacheSecs;
+    }
+
+    public Builder setFeatureFlagInProcessCacheSecs(int featureFlagInProcessCacheSecs) {
+      this.featureFlagInProcessCacheSecs = featureFlagInProcessCacheSecs;
+      return this;
     }
 
     public ApiClient build() {
