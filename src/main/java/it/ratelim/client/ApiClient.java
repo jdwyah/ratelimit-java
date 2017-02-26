@@ -1,8 +1,12 @@
 package it.ratelim.client;
 
+import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.annotation.Timed;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.Lists;
+import it.ratelim.client.util.Cache;
+import it.ratelim.client.util.MemcachedWrapper;
 import it.ratelim.data.RateLimitProtos;
 import net.spy.memcached.MemcachedClientIF;
 import org.apache.http.Header;
@@ -46,8 +50,8 @@ public class ApiClient implements Closeable {
   private final CloseableHttpClient httpClient;
   private final String urlBase;
   private final String accountId;
-
-  private Optional<MemcachedClientIF> memcachedClientIF = Optional.empty();
+  private final ApiClientMetrics apiClientMetrics;
+  private Optional<Cache> distributedCache = Optional.empty();
   private Optional<String> featureFlagCacheKey = Optional.empty();
 
   private LoadingCache<String, Optional<RateLimitProtos.FeatureFlag>> inProcessFlagCache;
@@ -59,27 +63,29 @@ public class ApiClient implements Closeable {
 
   public ApiClient(Builder builder) {
 
-    this.memcachedClientIF = builder.getMemcachedClientIF();
+    this.distributedCache = builder.getDistributedCache();
     this.featureFlagMemcachedSecs = builder.getFeatureFlagMemcachedSecs();
     this.featureFlagRefetchBuffer = builder.getFeatureFlagRefetchBuffer();
     this.featureFlagInProcessCacheSecs = builder.getFeatureFlagInProcessCacheSecs();
 
-    String pass;
+    this.apiClientMetrics = new ApiClientMetrics(builder.getMetricRegistry());
+
+    String password;
     if (builder.getApikey() == null) {
       LOGGER.warn("Misconfigured RateLimitAPIClient. No API KEY. Set RATELIMIT_API_KEY");
       accountId = "";
-      pass = "";
+      password = "";
     } else {
       final String[] apikeyparts = builder.getApikey().split("\\|");
       this.accountId = apikeyparts[0];
-      pass = apikeyparts[1];
+      password = apikeyparts[1];
     }
     this.urlBase = String.format("%s://%s:%d/api/v1/",
         builder.getPort() == 443 ? "https" : "http",
         builder.getHost(),
         builder.getPort());
 
-    httpClient = setupHttpClient(builder, pass);
+    httpClient = setupHttpClient(builder, password);
 
     inProcessFlagCache = newBuilder()
         .maximumSize(1000)
@@ -87,7 +93,7 @@ public class ApiClient implements Closeable {
         .build(
             new CacheLoader<String, Optional<RateLimitProtos.FeatureFlag>>() {
               public Optional<RateLimitProtos.FeatureFlag> load(String feature) throws IOException {
-                return getAllFlagsInternal(feature);
+                return findFlag(feature);
               }
             });
   }
@@ -121,6 +127,7 @@ public class ApiClient implements Closeable {
     return limitCheck(limitRequest, RateLimitProtos.OnFailure.LOG_AND_PASS);
   }
 
+  @Timed
   public RateLimitProtos.LimitResponse limitCheck(RateLimitProtos.LimitRequest limitRequest, RateLimitProtos.OnFailure onFailure) {
 
     HttpPost httppost = new HttpPost(getUrl("limitcheck"));
@@ -130,7 +137,13 @@ public class ApiClient implements Closeable {
     ResponseHandler<RateLimitProtos.LimitResponse> responseHandler = response -> {
       int status = response.getStatusLine().getStatusCode();
       if (status >= 200 && status < 300) {
-        return RateLimitProtos.LimitResponse.parseFrom(EntityUtils.toByteArray(response.getEntity()));
+        final RateLimitProtos.LimitResponse limitResponse = RateLimitProtos.LimitResponse.parseFrom(EntityUtils.toByteArray(response.getEntity()));
+        if (limitResponse.getPassed()) {
+          apiClientMetrics.mark(ApiClientMetrics.METRICS.IT_RATELIM_LIMIT_CHECK_PASS);
+        } else {
+          apiClientMetrics.mark(ApiClientMetrics.METRICS.IT_RATELIM_LIMIT_CHECK_HIT);
+        }
+        return limitResponse;
       } else {
         throw new ClientProtocolException("Unexpected response status: " + status);
       }
@@ -179,6 +192,7 @@ public class ApiClient implements Closeable {
     return httpClient.execute(req, responseHandler).getDefinitionsList();
   }
 
+  @Timed
   public void limitReturn(RateLimitProtos.LimitResponse limitResponse) throws IOException {
     HttpPost httppost = new HttpPost(getUrl("limitreturn"));
     httppost.setEntity(new ByteArrayEntity(limitResponse.toByteArray()));
@@ -191,6 +205,7 @@ public class ApiClient implements Closeable {
    * @param limitDefinition
    * @throws IOException
    */
+  @Timed
   public void limitCreate(RateLimitProtos.LimitDefinition limitDefinition) throws IOException {
     HttpPost httppost = new HttpPost(getUrl("limits"));
     ByteArrayEntity entity = new ByteArrayEntity(limitDefinition.toByteArray());
@@ -204,6 +219,7 @@ public class ApiClient implements Closeable {
    * @param limitDefinition
    * @throws IOException
    */
+  @Timed
   public void limitUpsert(RateLimitProtos.LimitDefinition limitDefinition) throws IOException {
     HttpPut httpPut = new HttpPut(getUrl("limits"));
     ByteArrayEntity entity = new ByteArrayEntity(limitDefinition.toByteArray());
@@ -220,6 +236,7 @@ public class ApiClient implements Closeable {
     return featureIsOnFor(feature, Optional.of(lookupKey), Lists.newArrayList());
   }
 
+  @Timed
   public boolean featureIsOnFor(String feature, Optional<String> lookupKey, List<String> attributes) {
     try {
       final Optional<RateLimitProtos.FeatureFlag> featureFlag = inProcessFlagCache.get(feature);
@@ -236,33 +253,38 @@ public class ApiClient implements Closeable {
     return false;
   }
 
-  private Optional<RateLimitProtos.FeatureFlag> getAllFlagsInternal(String feature) throws IOException {
+  private Optional<RateLimitProtos.FeatureFlag> findFlag(String feature) {
     return getAllFlags().stream()
         .filter((ff) -> ff.getFeature().equals(feature))
         .findFirst();
   }
 
-  public Collection<RateLimitProtos.FeatureFlag> getAllFlags() throws IOException {
-    if (memcachedClientIF.isPresent()) {
-      if (!featureFlagCacheKey.isPresent()) {
-        featureFlagCacheKey = Optional.of(String.format("it.ratelim.java.%s.featureflags", accountId));
-      }
+  @Timed
+  public Collection<RateLimitProtos.FeatureFlag> getAllFlags() {
+    try {
+      if (distributedCache.isPresent()) {
+        if (!featureFlagCacheKey.isPresent()) {
+          featureFlagCacheKey = Optional.of(String.format("it.ratelim.java.%s.featureflags", accountId));
+        }
 
-      final byte[] bytes = (byte[]) memcachedClientIF.get().get(featureFlagCacheKey.get());
-      RateLimitProtos.FeatureFlags featureFlags;
-      if (bytes == null) {
-        featureFlags = getAllFlagsReq();
-        memcachedClientIF.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, featureFlags.toByteArray());
-        return featureFlags.getFlagsList();
+        final byte[] bytes = distributedCache.get().get(featureFlagCacheKey.get());
+        RateLimitProtos.FeatureFlags featureFlags;
+        if (bytes == null) {
+          featureFlags = getAllFlagsApiRequest();
+          distributedCache.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, featureFlags.toByteArray());
+          return featureFlags.getFlagsList();
+        } else {
+          featureFlags = RateLimitProtos.FeatureFlags.parseFrom(bytes);
+
+          fetchAndCacheFlagsAsyncIfNecessary(featureFlags);
+
+          return featureFlags.getFlagsList();
+        }
       } else {
-        featureFlags = RateLimitProtos.FeatureFlags.parseFrom(bytes);
-
-        fetchAndCacheFlagsAsyncIfNecessary(featureFlags);
-
-        return featureFlags.getFlagsList();
+        return getAllFlagsApiRequest().getFlagsList();
       }
-    } else {
-      return getAllFlagsReq().getFlagsList();
+    } catch (IOException | ExecutionException | InterruptedException e) {
+      throw new RuntimeException(e);
     }
   }
 
@@ -275,8 +297,8 @@ public class ApiClient implements Closeable {
     if (featureFlags.getCacheExpiry() < DateTime.now().getMillis() + featureFlagRefetchBuffer * Math.random()) {
       background.execute(() -> {
         try {
-          final RateLimitProtos.FeatureFlags newFeatureFlags = getAllFlagsReq();
-          memcachedClientIF.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, newFeatureFlags.toByteArray());
+          final RateLimitProtos.FeatureFlags newFeatureFlags = getAllFlagsApiRequest();
+          distributedCache.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, newFeatureFlags.toByteArray());
         } catch (IOException e) {
           LOGGER.warn("Exception trying background feature flag sync", e);
         }
@@ -284,8 +306,8 @@ public class ApiClient implements Closeable {
     }
   }
 
-
-  private RateLimitProtos.FeatureFlags getAllFlagsReq() throws IOException {
+  @Timed
+  RateLimitProtos.FeatureFlags getAllFlagsApiRequest() throws IOException {
     HttpGet req = new HttpGet(getUrl("featureflags"));
     ResponseHandler<RateLimitProtos.FeatureFlags> responseHandler = response -> {
       int status = response.getStatusLine().getStatusCode();
@@ -311,10 +333,12 @@ public class ApiClient implements Closeable {
     private String host = "www.ratelim.it";
     private int port = 443;
     private String apikey;
-    private Optional<net.spy.memcached.MemcachedClientIF> memcachedClientIF = Optional.empty();
+    private Optional<Cache> distributedCache = Optional.empty();
+    private Optional<MetricRegistry> metricRegistry = Optional.empty();
     private int featureFlagMemcachedSecs = 60;
     private long featureFlagRefetchBuffer = 10;
     private int featureFlagInProcessCacheSecs = 50;
+
 
     public Builder() {
       this.apikey = System.getenv("RATELIMIT_API_KEY");
@@ -329,12 +353,17 @@ public class ApiClient implements Closeable {
       return this;
     }
 
-    public Optional<MemcachedClientIF> getMemcachedClientIF() {
-      return memcachedClientIF;
+    public Optional<Cache> getDistributedCache() {
+      return distributedCache;
     }
 
     public Builder setMemcachedClientIF(MemcachedClientIF memcachedClientIF) {
-      this.memcachedClientIF = Optional.of(memcachedClientIF);
+      this.distributedCache = Optional.of(new MemcachedWrapper(memcachedClientIF));
+      return this;
+    }
+
+    public Builder setDistributedCache(Cache distributedCache) {
+      this.distributedCache = Optional.of(distributedCache);
       return this;
     }
 
@@ -354,6 +383,15 @@ public class ApiClient implements Closeable {
 
     public String getApikey() {
       return apikey;
+    }
+
+    public Optional<MetricRegistry> getMetricRegistry() {
+      return metricRegistry;
+    }
+
+    public Builder setMetricRegistry(MetricRegistry metricRegistry) {
+      this.metricRegistry = Optional.of(metricRegistry);
+      return this;
     }
 
     public int getFeatureFlagMemcachedSecs() {
