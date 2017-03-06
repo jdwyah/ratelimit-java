@@ -4,15 +4,13 @@ option java_outer_classname = "RateLimitProtos";
 
 message LimitResponse {
     enum LimitPolicyNames {
-        SECONDLY = 1;
-        MINUTELY = 2;
+        SECONDLY_ROLLING = 1;
         MINUTELY_ROLLING = 3;
-        HOURLY = 4;
         HOURLY_ROLLING = 5;
-        DAILY = 6;
         DAILY_ROLLING = 7;
-        MONTHLY = 8;
+        MONTHLY_ROLLING = 8;
         INFINITE = 9;
+        YEARLY_ROLLING = 10;
     }
 
     optional bool passed = 1 [default = true];
@@ -20,7 +18,7 @@ message LimitResponse {
     optional string enforced_group = 3; // events:pageview:homepage:123123
     optional int64 current_bucket = 4; // 9
     optional string policy_group = 5; // events:pageview
-    optional LimitPolicyNames policy_name = 6; // MINUTELY
+    optional LimitPolicyNames policy_name = 6; // MINUTELY_ROLLING
     optional int32 policy_limit = 7; // 10
     optional int64 amount = 8 [default = 1]; // 1
     optional int64 limit_reset_at = 9;

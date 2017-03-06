@@ -5,6 +5,7 @@ import com.codahale.metrics.annotation.Timed;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.Lists;
+import com.google.inject.Inject;
 import it.ratelim.client.util.Cache;
 import it.ratelim.client.util.MemcachedWrapper;
 import it.ratelim.data.RateLimitProtos;
@@ -55,18 +56,19 @@ public class ApiClient implements Closeable {
   private Optional<String> featureFlagCacheKey = Optional.empty();
 
   private LoadingCache<String, Optional<RateLimitProtos.FeatureFlag>> inProcessFlagCache;
-  private final int featureFlagMemcachedSecs;
+  private final int featureFlagDistributedCacheExpirySecs;
   private final long featureFlagRefetchBuffer;
-  private final int featureFlagInProcessCacheSecs;
+  private final int featureFlagInProcessCacheExpirySecs;
 
   private Executor background = Executors.newSingleThreadExecutor();
 
+  @Inject
   public ApiClient(Builder builder) {
 
     this.distributedCache = builder.getDistributedCache();
-    this.featureFlagMemcachedSecs = builder.getFeatureFlagMemcachedSecs();
+    this.featureFlagDistributedCacheExpirySecs = builder.getFeatureFlagDistributedCacheExpirySecs();
     this.featureFlagRefetchBuffer = builder.getFeatureFlagRefetchBuffer();
-    this.featureFlagInProcessCacheSecs = builder.getFeatureFlagInProcessCacheSecs();
+    this.featureFlagInProcessCacheExpirySecs = builder.getFeatureFlagInProcessCacheExpirySecs();
 
     this.apiClientMetrics = new ApiClientMetrics(builder.getMetricRegistry());
 
@@ -89,7 +91,7 @@ public class ApiClient implements Closeable {
 
     inProcessFlagCache = newBuilder()
         .maximumSize(1000)
-        .expireAfterWrite(featureFlagInProcessCacheSecs, TimeUnit.SECONDS)
+        .expireAfterWrite(featureFlagInProcessCacheExpirySecs, TimeUnit.SECONDS)
         .build(
             new CacheLoader<String, Optional<RateLimitProtos.FeatureFlag>>() {
               public Optional<RateLimitProtos.FeatureFlag> load(String feature) throws IOException {
@@ -270,8 +272,9 @@ public class ApiClient implements Closeable {
         final byte[] bytes = distributedCache.get().get(featureFlagCacheKey.get());
         RateLimitProtos.FeatureFlags featureFlags;
         if (bytes == null) {
+
           featureFlags = getAllFlagsApiRequest();
-          distributedCache.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, featureFlags.toByteArray());
+          distributedCache.get().set(featureFlagCacheKey.get(), featureFlagDistributedCacheExpirySecs, featureFlags.toByteArray());
           return featureFlags.getFlagsList();
         } else {
           featureFlags = RateLimitProtos.FeatureFlags.parseFrom(bytes);
@@ -298,7 +301,7 @@ public class ApiClient implements Closeable {
       background.execute(() -> {
         try {
           final RateLimitProtos.FeatureFlags newFeatureFlags = getAllFlagsApiRequest();
-          distributedCache.get().set(featureFlagCacheKey.get(), featureFlagMemcachedSecs, newFeatureFlags.toByteArray());
+          distributedCache.get().set(featureFlagCacheKey.get(), featureFlagDistributedCacheExpirySecs, newFeatureFlags.toByteArray());
         } catch (IOException e) {
           LOGGER.warn("Exception trying background feature flag sync", e);
         }
@@ -314,7 +317,7 @@ public class ApiClient implements Closeable {
       if (status >= 200 && status < 300) {
         final RateLimitProtos.FeatureFlags featureFlags = RateLimitProtos.FeatureFlags.parseFrom(EntityUtils.toByteArray(response.getEntity()));
         return featureFlags.toBuilder()
-            .setCacheExpiry(DateTime.now().getMillis() + featureFlagMemcachedSecs)
+            .setCacheExpiry(DateTime.now().getMillis() + featureFlagDistributedCacheExpirySecs)
             .build();
       } else {
         throw new ClientProtocolException("Unexpected response status: " + status);
@@ -335,8 +338,8 @@ public class ApiClient implements Closeable {
     private String apikey;
     private Optional<Cache> distributedCache = Optional.empty();
     private Optional<MetricRegistry> metricRegistry = Optional.empty();
-    private int featureFlagMemcachedSecs = 60;
-    private long featureFlagRefetchBuffer = 10;
+    private int featureFlagDistributedCacheExpirySecs = 180;
+    private long featureFlagRefetchBuffer = 100;
     private int featureFlagInProcessCacheSecs = 50;
 
 
@@ -394,12 +397,12 @@ public class ApiClient implements Closeable {
       return this;
     }
 
-    public int getFeatureFlagMemcachedSecs() {
-      return featureFlagMemcachedSecs;
+    public int getFeatureFlagDistributedCacheExpirySecs() {
+      return featureFlagDistributedCacheExpirySecs;
     }
 
-    public Builder setFeatureFlagMemcachedSecs(int featureFlagMemcachedSecs) {
-      this.featureFlagMemcachedSecs = featureFlagMemcachedSecs;
+    public Builder setFeatureFlagDistributedCacheExpirySecs(int featureFlagDistributedCacheExpirySecs) {
+      this.featureFlagDistributedCacheExpirySecs = featureFlagDistributedCacheExpirySecs;
       return this;
     }
 
@@ -412,7 +415,7 @@ public class ApiClient implements Closeable {
       return this;
     }
 
-    public int getFeatureFlagInProcessCacheSecs() {
+    public int getFeatureFlagInProcessCacheExpirySecs() {
       return featureFlagInProcessCacheSecs;
     }
 
